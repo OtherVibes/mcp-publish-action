@@ -1,0 +1,300 @@
+name: 'Publish MCP Server'
+description: 'Publish an MCP server to the official MCP Registry using the MCP Publisher CLI.'
+author: 'OtherVibes'
+branding:
+  icon: 'upload-cloud'
+  color: 'blue'
+
+inputs:
+  name:
+    description: 'Server name in reverse-DNS format. Must contain exactly one forward slash separating namespace from server name.'
+    required: true
+  description:
+    description: 'Clear human-readable explanation of server functionality. Should focus on capabilities, not implementation details.'
+    required: true
+  version:
+    description: 'Version string for this server. SHOULD follow semantic versioning (e.g., "1.0.2", "2.1.0-alpha"). Non-semantic versions are allowed but may not sort predictably.'
+    required: true
+  website_url:
+    description: 'Optional URL to the server homepage, documentation, or project website. Provides a central link for users to learn more about the server.'
+    required: false
+  registry_type:
+    description: "Registry type indicating how to download packages."
+    required: true
+    type: choice
+    options:
+      - pypi
+      - npm
+      - oci
+      - nuget
+      - mcpb
+  identifier:
+    description: 'Package identifier - either a package name (for registries) or URL (for direct downloads).'
+    required: true
+  package_version:
+    description: 'Package version. Must be a specific version. Version ranges are rejected. Defaults to top-level version when omitted.'
+    required: false
+  transport_type:
+    description: "Transport type for the package."
+    required: true
+    type: choice
+    options:
+      - stdio
+      - streamable-http
+      - sse
+  transport_url:
+    description: 'Transport URL (required for streamable-http and sse transports).'
+    required: false
+  registry_base_url:
+    description: 'Base URL of the package registry.'
+    required: false
+  file_sha256:
+    description: 'SHA-256 hash of the package file for integrity verification. Required for MCPB packages and optional for other package types.'
+    required: false
+  status:
+    description: "Server lifecycle status. 'deprecated' indicates the server is no longer recommended for new usage. 'deleted' indicates the server should never be installed and existing installations should be uninstalled."
+    required: false
+    type: choice
+    default: 'active'
+    options:
+      - active
+      - deprecated
+      - deleted
+  registry_url:
+    description: 'Registry base URL for publishing and verification.'
+    required: false
+    default: 'https://registry.modelcontextprotocol.io'
+  verify:
+    description: 'When true, validates the published version is visible in the registry.'
+    required: false
+    type: boolean
+    default: true
+
+outputs:
+  version:
+    description: 'Published version.'
+    value: ${{ steps.prepare.outputs.version }}
+  server_name:
+    description: 'Published server identifier.'
+    value: ${{ steps.prepare.outputs.name }}
+  server_json:
+    description: 'Full server definition JSON used for publication.'
+    value: ${{ steps.prepare.outputs.json }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install MCP Publisher CLI
+      id: install_cli
+      shell: bash
+      run: |
+        set -eo pipefail
+        version="1.0.0"
+        os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+        arch="$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
+        url="https://github.com/modelcontextprotocol/registry/releases/download/v${version}/mcp-publisher_${version}_${os}_${arch}.tar.gz"
+        echo "Downloading mcp-publisher from $url"
+        temp_dir="${RUNNER_TEMP:-$PWD}"
+        mkdir -p "$temp_dir"
+        curl -sSL "$url" | tar xz -C "$temp_dir" mcp-publisher
+        chmod +x "$temp_dir/mcp-publisher"
+        echo "$temp_dir" >>"$GITHUB_PATH"
+        echo "cli=$temp_dir/mcp-publisher" >>"$GITHUB_OUTPUT"
+
+    - name: Prepare server.json (schema-aligned)
+      id: prepare
+      shell: bash
+      run: |
+        set -eo pipefail
+        # Ensure jq is available
+        if ! command -v jq >/dev/null 2>&1; then
+          if command -v sudo >/dev/null 2>&1; then
+            sudo apt-get update -y && sudo apt-get install -y jq
+          else
+            echo "::error::jq is required but not installed and sudo is unavailable." >&2
+            exit 1
+          fi
+        fi
+
+        # Validate required fields
+        if [[ -z "${{ inputs.name }}" || -z "${{ inputs.description }}" || -z "${{ inputs.version }}" || -z "${{ inputs.registry_type }}" || -z "${{ inputs.identifier }}" || -z "${{ inputs.transport_type }}" ]]; then
+          echo "::error::Missing required inputs. Required: name, description, version, registry_type, identifier, transport_type." >&2
+          exit 1
+        fi
+
+        # Validate enumerated inputs
+        case "${{ inputs.transport_type }}" in
+          stdio|streamable-http|sse) ;;
+          *)
+            echo "::error::Invalid transport_type '${{ inputs.transport_type }}'. Allowed: stdio, streamable-http, sse." >&2
+            exit 1
+            ;;
+        esac
+        case "${{ inputs.registry_type }}" in
+          pypi|npm|oci|nuget|mcpb) ;;
+          *)
+            echo "::error::Invalid registry_type '${{ inputs.registry_type }}'. Allowed: pypi, npm, oci, nuget, mcpb." >&2
+            exit 1
+            ;;
+        esac
+        case "${{ inputs.status }}" in
+          ''|active|deprecated|deleted) ;;
+          *)
+            echo "::error::Invalid status '${{ inputs.status }}'. Allowed: active, deprecated, deleted." >&2
+            exit 1
+            ;;
+        esac
+
+        # Transport validation for non-stdio types
+        if [[ "${{ inputs.transport_type }}" != "stdio" && -z "${{ inputs.transport_url }}" ]]; then
+          echo "::error::transport_url is required when transport_type is 'streamable-http' or 'sse'." >&2
+          exit 1
+        fi
+
+        # Validate name format and length
+        name_val="${{ inputs.name }}"
+        if [[ ! "$name_val" =~ ^[a-zA-Z0-9.-]+/[a-zA-Z0-9._-]+$ ]]; then
+          echo "::error::Invalid name '${{ inputs.name }}'. Must match ^[a-zA-Z0-9.-]+/[a-zA-Z0-9._-]+$." >&2
+          exit 1
+        fi
+        name_len=${#name_val}
+        if (( name_len < 3 || name_len > 200 )); then
+          echo "::error::Name length must be between 3 and 200 characters." >&2
+          exit 1
+        fi
+
+        # Validate description length (1..100 per schema)
+        desc_val="${{ inputs.description }}"
+        desc_len=${#desc_val}
+        if (( desc_len < 1 || desc_len > 100 )); then
+          echo "::error::Description length must be between 1 and 100 characters." >&2
+          exit 1
+        fi
+
+        version_input="${{ inputs.version }}"
+        if [[ "$version_input" =~ ^v(.+)$ ]]; then
+          version="${BASH_REMATCH[1]}"
+        else
+          version="$version_input"
+        fi
+
+        # Reject ranges and reserved strings
+        if [[ "$version" == "latest" || "$version" =~ [\^~><*x] ]]; then
+          echo "::error::Version must be a specific version (no ranges). Disallowed examples: '^1.2.3', '~1.2.3', '>=1.2.3', '1.x', '1.*', 'latest'." >&2
+          exit 1
+        fi
+        pkg_version="${{ inputs.package_version }}"
+        if [[ -z "$pkg_version" ]]; then
+          pkg_version="$version"
+        fi
+
+        # Require file hash for MCPB packages
+        if [[ "${{ inputs.registry_type }}" == "mcpb" && -z "${{ inputs.file_sha256 }}" ]]; then
+          echo "::error::file_sha256 is required for registry_type=mcpb." >&2
+          exit 1
+        fi
+        if [[ -n "${{ inputs.file_sha256 }}" && ! "${{ inputs.file_sha256 }}" =~ ^[a-f0-9]{64}$ ]]; then
+          echo "::error::file_sha256 must be a 64-character lowercase hex SHA-256 hash." >&2
+          exit 1
+        fi
+
+        repo_url="https://github.com/${GITHUB_REPOSITORY}"
+
+        # Build transport object
+        transport_json=$(jq -n --arg t "${{ inputs.transport_type }}" --arg url "${{ inputs.transport_url }}" '
+          if $t == "stdio" then {type: $t}
+          elif $t == "streamable-http" or $t == "sse" then {type: $t, url: $url}
+          else {type: $t}
+          end')
+
+        # Build package object
+        package_json=$(jq -n \
+          --arg rt "${{ inputs.registry_type }}" \
+          --arg id "${{ inputs.identifier }}" \
+          --arg pv "$pkg_version" \
+          --arg rbu "${{ inputs.registry_base_url }}" \
+          --arg sha "${{ inputs.file_sha256 }}" \
+          --argjson tr "$transport_json" '
+          {
+            registry_type: $rt,
+            identifier: $id,
+            version: $pv,
+            transport: $tr
+          }
+          + (if ($rbu|length) > 0 then {registry_base_url: $rbu} else {} end)
+          + (if ($sha|length) > 0 then {file_sha256: $sha} else {} end)
+        ')
+
+        server_json_path="server.json"
+        jq -n \
+          --arg schema "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json" \
+          --arg name "${{ inputs.name }}" \
+          --arg desc "${{ inputs.description }}" \
+          --arg version "$version" \
+          --arg website "${{ inputs.website_url }}" \
+          --arg repo_url "$repo_url" \
+          --arg source "github" \
+          --arg status "${{ inputs.status }}" \
+          --argjson pkg "$package_json" '
+          {
+            $schema: $schema,
+            name: $name,
+            description: $desc,
+            version: $version,
+            status: $status,
+            repository: { url: $repo_url, source: $source },
+            packages: [ $pkg ]
+          }
+          + (if ($website|length) > 0 then {website_url: $website} else {} end)
+        ' > "$server_json_path"
+
+        name="$(jq -r '.name' "$server_json_path")"
+        {
+          echo "path=$server_json_path"
+          echo "name=$name"
+          echo "version=$version"
+          echo "json<<'JSON'"
+          cat "$server_json_path"
+          echo 'JSON'
+        } >>"$GITHUB_OUTPUT"
+        echo "Prepared server.json at $server_json_path for $name@$version"
+
+    - name: Login to MCP Registry
+      shell: bash
+      run: |
+        set -eo pipefail
+        mcp-publisher login github-oidc --registry="${{ inputs.registry_url }}"
+
+    - name: Publish to MCP Registry
+      shell: bash
+      run: |
+        set -eo pipefail
+        mcp-publisher publish --registry="${{ inputs.registry_url }}" "${{ steps.prepare.outputs.path }}"
+        echo "Published ${{ steps.prepare.outputs.name }} version ${{ steps.prepare.outputs.version }}"
+
+    - name: Verify publication
+      if: ${{ inputs.verify == 'true' }}
+      shell: bash
+      env:
+        REGISTRY_URL: ${{ inputs.registry_url }}
+        NAME: ${{ steps.prepare.outputs.name }}
+        VERSION: ${{ steps.prepare.outputs.version }}
+      run: |
+        set -eo pipefail
+        echo "🔍 Verifying publication for $NAME@$VERSION"
+        server_name_only="${NAME##*/}"
+        base="${REGISTRY_URL%%/}"
+        search_url="$base/v0/servers?search=$server_name_only"
+        echo "Fetching $search_url"
+        curl -sS "$search_url" > search_results.json
+        version_found="$(jq -r --arg name "$NAME" --arg version "$VERSION" '.servers[]? | select(.name == $name and .version == $version) | .version' search_results.json)"
+        if [[ -n "$version_found" ]]; then
+          echo "✅ Server $NAME version $VERSION is listed in the registry!"
+          jq -r --arg name "$NAME" --arg version "$VERSION" '.servers[]? | select(.name == $name and .version == $version) | {name, version, description, is_latest: ._meta."io.modelcontextprotocol.registry/official".is_latest}' search_results.json
+          echo "📦 All published versions:"
+          jq -r --arg name "$NAME" '.servers[]? | select(.name == $name) | "  - v" + .version + " (latest: " + ((._meta."io.modelcontextprotocol.registry/official".is_latest // false) | tostring) + ")"' search_results.json | sort -V
+        else
+          echo "❌ Server $NAME version $VERSION not found in registry"
+          jq -r --arg name "$NAME" '.servers[]? | select(.name == $name) | "  - v" + .version' search_results.json | sort -V || true
+          exit 1
+        fi
