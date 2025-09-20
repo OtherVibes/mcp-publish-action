@@ -221,8 +221,8 @@ runs:
             version: $pv,
             transport: $tr
           }
-          + (if ($rbu|length) > 0 then {registry_base_url: $rbu} else {} end)
-          + (if ($sha|length) > 0 then {file_sha256: $sha} else {} end)
+          + (if $rbu != "" then {registry_base_url: $rbu} else {} end)
+          + (if $sha != "" then {file_sha256: $sha} else {} end)
         ')
 
         server_json_path="server.json"
@@ -245,7 +245,7 @@ runs:
             repository: { url: $repo_url, source: $source },
             packages: [ $pkg ]
           }
-          + (if ($website|length) > 0 then {website_url: $website} else {} end)
+          + (if $website != "" then {website_url: $website} else {} end)
         ' > "$server_json_path"
 
         name="$(jq -r '.name' "$server_json_path")"
