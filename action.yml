@@ -179,7 +179,7 @@ runs:
         fi
 
         # Reject ranges and reserved strings
-        if [[ "$version" == "latest" || "$version" =~ [\^~><*x] ]]; then
+        if [[ "$version" == "latest" || "$version" =~ [\^~*x] || "$version" == *"<"* || "$version" == *">"* ]]; then
           echo "::error::Version must be a specific version (no ranges). Disallowed examples: '^1.2.3', '~1.2.3', '>=1.2.3', '1.x', '1.*', 'latest'." >&2
           exit 1
         fi
