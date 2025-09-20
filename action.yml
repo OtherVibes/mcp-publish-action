@@ -258,13 +258,15 @@ runs:
         ' > "$server_json_path"
 
         name="$(jq -r '.name' "$server_json_path")"
+        # Generate a unique delimiter for multiline output
+        delimiter="EOF_$(date +%s)_$$"
         {
           echo "path=$server_json_path"
           echo "name=$name"
           echo "version=$version"
-          echo "json<<'JSON'"
+          echo "json<<$delimiter"
           cat "$server_json_path"
-          echo 'JSON'
+          echo "$delimiter"
         } >>"$GITHUB_OUTPUT"
         echo "Prepared server.json at $server_json_path for $name@$version"
 
